@@ -1,5 +1,5 @@
 # ==========================================
-# app.py — Multi-VC + Auto-Channel Helper v4 (Clean Rewrite)
+# app.py — Instant VC Join + Instant React/View v5
 # ==========================================
 import builtins as _builtins
 
@@ -20,9 +20,8 @@ try:
     if os.path.exists(_ENV_PATH):
         load_dotenv(_ENV_PATH, override=True)
     else:
-        load_dotenv(override=True)  # fallback: look in cwd
+        load_dotenv(override=True)
 except ImportError:
-    # dotenv not installed — try manual parse so .env still works
     _ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
     if os.path.exists(_ENV_PATH):
         with open(_ENV_PATH) as _f:
@@ -121,6 +120,11 @@ from pyrogram.types import (Message, ReplyKeyboardMarkup, KeyboardButton,
 from pyrogram.raw import functions
 from pyrogram.raw.functions.messages import GetMessagesViews, SendReaction
 from pyrogram.raw.types import ReactionEmoji
+from pyrogram.handlers import RawUpdateHandler
+from pyrogram.raw.types import (
+    UpdateGroupCall, UpdateGroupCallConnection, UpdateGroupCallParticipants,
+    UpdateChannel, UpdateNewChannelMessage, UpdateNewMessage,
+)
 from motor.motor_asyncio import AsyncIOMotorClient
 
 PTGCALLS_AVAILABLE = False
@@ -146,17 +150,18 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "your_bot_token").strip()
 MONGO_URI = os.getenv("MONGO_URI", os.getenv("MONGO_URL", "")).strip()
 OWNER_ID  = int(os.getenv("OWNER_ID", "123456789").strip() or "123456789")
 
-# Default channels: comma-separated in env, or managed from Owner Panel
-DEFAULT_CHANNELS_ENV = os.getenv("DEFAULT_CHANNELS", "").strip()
+# ==========================================
+# 🗄️ NEW DATABASE NAME
+# ==========================================
+DB_NAME = os.getenv("DB_NAME", "smm_manager").strip()
 
+DEFAULT_CHANNELS_ENV = os.getenv("DEFAULT_CHANNELS", "").strip()
 DEFAULT_REACT_EMOJI = os.getenv("DEFAULT_REACT_EMOJI", "👍").strip()
 
-# New-post polling (fast: reacts & views are near-instant)
-CHANNEL_POST_POLL = int(os.getenv("CHANNEL_POST_POLL_SECONDS", "15"))   # check every 15s
-# VC livestream polling
-VC_LIVESTREAM_POLL = int(os.getenv("VC_LIVESTREAM_POLL_SECONDS", "15")) # check every 15s
-
-VC_JOIN_DELAY_SECONDS = int(os.getenv("VC_JOIN_DELAY_SECONDS", "7"))
+# Poll timings (fast backup poller)
+CHANNEL_POST_POLL = int(os.getenv("CHANNEL_POST_POLL_SECONDS", "10"))
+VC_LIVESTREAM_POLL = int(os.getenv("VC_LIVESTREAM_POLL_SECONDS", "5"))  # faster backup
+VC_JOIN_DELAY_SECONDS = int(os.getenv("VC_JOIN_DELAY_SECONDS", "1"))    # near-instant joins
 
 POSITIVE_REACTIONS = ["👍","❤️","🔥","🥰","👏","😁","🎉","🤩","🙏","💯","❤️‍🔥","😍","👌","🕊"]
 
@@ -183,16 +188,17 @@ _ensure_silent_audio()
 # ==========================================
 db_client = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=8000) if MONGO_URI else None
 if db_client:
-    db               = db_client["telegram_manager"]
+    db               = db_client[DB_NAME]
     accounts_col     = db["sessions"]
     admin_col        = db["admins"]
     pseudo_col       = db["pseudo_owners"]
     users_col        = db["users"]
     settings_col     = db["settings"]
-    helper_col       = db["vc_helpers"]          # helpers list (accounts used to join VC)
-    defaultchan_col  = db["default_channels"]    # multiple default channels
-    chan_seen_col    = db["channel_seen"]        # seen post records per channel
+    helper_col       = db["vc_helpers"]
+    defaultchan_col  = db["default_channels"]
+    chan_seen_col    = db["channel_seen"]
     vc_state_col     = db["vc_state"]
+    logger.info(f"🗄️ Using database: {DB_NAME}")
 else:
     logger.critical("❌ MONGO_URI not set!")
     sys.exit(1)
@@ -220,7 +226,9 @@ worker_started = False
 channel_watcher_started = False
 vc_watcher_started = False
 multi_vc_registry = {}
-
+raw_listener_clients = {}   # phone -> running Client with RawUpdateHandler
+raw_listener_lock = asyncio.Lock()
+_watched_chat_ids = set()   # cache of default channel ids to filter updates
 _reaction_locks = {}
 
 
@@ -252,10 +260,6 @@ async def is_admin(user_id):
     if user_id == OWNER_ID: return True
     if await is_pseudo_owner(user_id): return True
     return bool(await db_call(admin_col.find_one, {"user_id": user_id}, default=None))
-
-async def is_owner_or_pseudo(user_id):
-    if user_id == OWNER_ID: return True
-    return await is_pseudo_owner(user_id)
 
 async def check_access(user_id):
     await db_call(users_col.update_one, {"user_id": user_id},
@@ -353,7 +357,6 @@ async def get_positive_reactions():
 # 📺 DEFAULT CHANNELS (multiple)
 # ==========================================
 async def get_default_channels() -> list:
-    """Return list of default channel links (from DB, plus env at first boot)."""
     chans = await db_call(defaultchan_col.find({}).to_list, length=50, default=[]) or []
     links = [c.get("link") for c in chans if c.get("link")]
     if not links and DEFAULT_CHANNELS_ENV:
@@ -367,15 +370,37 @@ async def get_default_channels() -> list:
     return links
 
 
+async def refresh_watched_chat_ids():
+    """Build a set of chat_ids for our default channels — used to filter raw updates."""
+    global _watched_chat_ids
+    new_set = set()
+    channels = await get_default_channels()
+    accs = await db_call(accounts_col.find({}).to_list, length=1, default=[]) or []
+    if not accs or not _is_valid_session(accs[0].get("session")):
+        return
+    try:
+        async with make_session_client(accs[0]["session"], "chid", no_updates=True) as app:
+            for ch in channels:
+                chat = await get_chat_safe(app, ch)
+                if chat:
+                    new_set.add(chat.id)
+    except Exception as e:
+        logger.debug(f"refresh_watched_chat_ids err: {e}")
+    _watched_chat_ids = new_set
+    logger.info(f"👁 Watched channel ids: {_watched_chat_ids}")
+
+
 async def add_default_channel(link: str, uid: int):
     await db_call(defaultchan_col.update_one,
         {"link": link},
         {"$set": {"link": link, "added_by": uid, "added_at": datetime.utcnow()}},
         upsert=True)
+    await refresh_watched_chat_ids()
 
 
 async def remove_default_channel(link: str):
     await db_call(defaultchan_col.delete_one, {"link": link})
+    await refresh_watched_chat_ids()
 
 
 # ==========================================
@@ -397,15 +422,10 @@ async def _safe_send_reaction_inner(app, peer, msg_id, emoji, max_retries=4):
             ))
             return True
         except FloodWait as fw:
-            wait = fw.value + 3
-            logger.warning(f"SendReaction FloodWait {wait}s (attempt {attempt})")
-            await asyncio.sleep(wait)
+            await asyncio.sleep(fw.value + 3)
         except Exception as e:
             err = str(e)
-            if any(k in err for k in (
-                "INTERDC_X_CALL_ERROR", "INTERDC", "500",
-                "TimedOut", "Network", "call failed", "connection"
-            )):
+            if any(k in err for k in ("INTERDC_X_CALL_ERROR","INTERDC","500","TimedOut","Network","call failed","connection")):
                 await asyncio.sleep(delay)
                 delay *= 1.7
                 continue
@@ -426,14 +446,10 @@ async def safe_view_message(app, peer, msg_id, max_retries=4):
             await app.invoke(GetMessagesViews(peer=peer, id=[msg_id], increment=True))
             return True
         except FloodWait as fw:
-            wait = fw.value + 3
-            await asyncio.sleep(wait)
+            await asyncio.sleep(fw.value + 3)
         except Exception as e:
             err = str(e)
-            if any(k in err for k in (
-                "INTERDC_X_CALL_ERROR", "INTERDC", "500",
-                "TimedOut", "Network", "call failed", "connection"
-            )):
+            if any(k in err for k in ("INTERDC_X_CALL_ERROR","INTERDC","500","TimedOut","Network","call failed","connection")):
                 await asyncio.sleep(delay)
                 delay *= 1.7
                 continue
@@ -471,7 +487,144 @@ async def auto_online_task():
 
 
 # ==========================================
-# 📺 INSTANT CHANNEL WATCHER (reaction + views)
+# 🔥 RAW UPDATE LISTENERS (INSTANT VC + POST)
+# ==========================================
+async def _on_raw_update(client: Client, update, users, chats):
+    """
+    Fires the moment Telegram delivers any raw update to a running user client.
+    We filter for:
+      - UpdateGroupCall / UpdateGroupCallParticipants → livestream started in a watched channel
+      - UpdateNewChannelMessage / UpdateNewMessage → new post in a watched channel
+    """
+    try:
+        # ---------- VC START EVENT ----------
+        if isinstance(update, (UpdateGroupCall, UpdateGroupCallParticipants)):
+            gc = getattr(update, "call", None) or getattr(update, "group_call", None)
+            if not gc: return
+            chat_id = None
+            # UpdateGroupCall has peer; UpdateGroupCallParticipants has call + participants
+            peer = getattr(update, "peer", None) or getattr(gc, "peer", None)
+            if peer is not None:
+                try:
+                    chat_id = pyrogram.utils.get_peer_id(peer)
+                except Exception:
+                    chat_id = None
+            if chat_id is None:
+                chat_id = getattr(gc, "chat_id", None) or getattr(gc, "channel_id", None)
+            if chat_id is None:
+                return
+            # normalize -100XXX form
+            if isinstance(chat_id, int) and chat_id > 0:
+                chat_id = int(f"-100{chat_id}")
+            if _watched_chat_ids and chat_id not in _watched_chat_ids:
+                return
+            logger.info(f"🔥 RAW VC START detected on chat {chat_id}")
+            # find which link this chat belongs to
+            channels = await get_default_channels()
+            for ch in channels:
+                try:
+                    async with make_session_client(
+                        (await db_call(accounts_col.find({}).to_list, length=1, default=[]) or [{}])[0].get("session",""),
+                        "vcmap", no_updates=True
+                    ) as probe:
+                        c = await get_chat_safe(probe, ch)
+                        if c and c.id == chat_id:
+                            asyncio.create_task(_auto_join_vc_for_channel(ch, force=True))
+                            break
+                except Exception:
+                    continue
+            return
+
+        # ---------- NEW POST EVENT ----------
+        if isinstance(update, (UpdateNewChannelMessage, UpdateNewMessage)):
+            msg = getattr(update, "message", None)
+            if not msg: return
+            peer = getattr(msg, "peer_id", None)
+            chat_id = None
+            if peer is not None:
+                try:
+                    chat_id = pyrogram.utils.get_peer_id(peer)
+                except Exception:
+                    chat_id = None
+            if chat_id is None:
+                return
+            if isinstance(chat_id, int) and chat_id > 0:
+                chat_id = int(f"-100{chat_id}")
+            if _watched_chat_ids and chat_id not in _watched_chat_ids:
+                return
+            mid = getattr(msg, "id", None)
+            if not mid:
+                return
+            logger.info(f"🔥 RAW NEW POST detected on chat {chat_id} msg {mid}")
+            # find channel link for this chat_id
+            channels = await get_default_channels()
+            for ch in channels:
+                try:
+                    accs = await db_call(accounts_col.find({}).to_list, length=1, default=[]) or []
+                    if not accs: continue
+                    async with make_session_client(accs[0]["session"], "pmap", no_updates=True) as probe:
+                        c = await get_chat_safe(probe, ch)
+                        if c and c.id == chat_id:
+                            asyncio.create_task(_process_single_post(ch, chat_id, mid))
+                            break
+                except Exception:
+                    continue
+            return
+    except Exception as e:
+        logger.debug(f"raw update handler err: {e}")
+
+
+async def _start_raw_listeners():
+    """
+    For every saved account, spin up a persistent client with a RawUpdateHandler
+    so we get *instant* notifications of new posts and VC starts.
+    """
+    async with raw_listener_lock:
+        accs = await db_call(accounts_col.find({}).to_list, length=3000, default=[]) or []
+        accs = [a for a in accs if _is_valid_session(a.get("session"))]
+        want_phones = {a.get("phone") for a in accs}
+
+        # stop listeners no longer wanted
+        for phone in list(raw_listener_clients.keys()):
+            if phone not in want_phones:
+                try:
+                    await raw_listener_clients[phone].stop()
+                except Exception: pass
+                raw_listener_clients.pop(phone, None)
+
+        # start listeners for new accounts
+        for acc in accs:
+            phone = acc.get("phone")
+            if not phone or phone in raw_listener_clients:
+                continue
+            try:
+                cli = Client(
+                    f"listener_{phone.replace('+','')}_{uuid.uuid4().hex[:4]}",
+                    api_id=API_ID, api_hash=API_HASH,
+                    session_string=acc["session"],
+                    in_memory=True,
+                )
+                cli.add_handler(RawUpdateHandler(_on_raw_update))
+                await cli.start()
+                raw_listener_clients[phone] = cli
+                logger.info(f"👂 Raw listener started for {phone}")
+                await asyncio.sleep(2)
+            except Exception as e:
+                logger.warning(f"listener start fail {phone}: {e}")
+
+
+async def raw_listener_supervisor():
+    await asyncio.sleep(30)
+    while True:
+        try:
+            await _start_raw_listeners()
+        except Exception as e:
+            logger.error(f"raw listener supervisor err: {e}")
+        await asyncio.sleep(300)   # rescan for new accounts every 5 min
+
+
+# ==========================================
+# 📺 INSTANT CHANNEL WATCHER (backup + bulk)
 # ==========================================
 async def _fetch_recent_ids(app, chat_id, limit=10):
     ids = []
@@ -484,34 +637,77 @@ async def _fetch_recent_ids(app, chat_id, limit=10):
     return ids
 
 
-async def _process_channel_new_posts(ch_link: str):
-    """Poll a default channel; react+view from ALL accounts on any new post."""
-    resolved = extract_username_from_link(ch_link)
-    if not resolved:
+async def _process_single_post(ch_link: str, chat_id: int, msg_id: int):
+    """React + view a single post from all accounts (used by RAW handler)."""
+    # skip if already seen
+    seen = await db_call(chan_seen_col.find_one,
+                         {"chat_id": chat_id, "msg_id": msg_id}, default=None)
+    if seen:
         return
+    await db_call(chan_seen_col.update_one,
+        {"chat_id": chat_id, "msg_id": msg_id},
+        {"$set": {"chat_id": chat_id, "msg_id": msg_id,
+                  "seen_at": datetime.utcnow()}}, upsert=True)
 
     accs = await db_call(accounts_col.find({}).to_list, length=3000, default=[]) or []
     accs = [a for a in accs if _is_valid_session(a.get("session"))]
-    if not accs:
-        return
+    if not accs: return
+    reactions = await get_positive_reactions()
+    ok_re = ok_vw = fail = 0
 
-    # 1) fetch recent post ids using first account
+    for acc in accs:
+        if kill_event.is_set(): break
+        app = None
+        try:
+            app = make_session_client(acc["session"], "rpost", no_updates=True)
+            await app.start()
+            try:
+                peer = await app.resolve_peer(chat_id)
+            except Exception:
+                try:
+                    await app.join_chat(ch_link)
+                except UserAlreadyParticipant: pass
+                except Exception: pass
+                chat = await get_chat_safe(app, ch_link)
+                if not chat: continue
+                peer = await app.resolve_peer(chat.id)
+            emoji = random.choice(reactions)
+            if await safe_send_reaction(app, peer, msg_id, emoji, chat_id=chat_id):
+                ok_re += 1
+            if await safe_view_message(app, peer, msg_id):
+                ok_vw += 1
+            await asyncio.sleep(random.uniform(0.3, 0.9))
+        except Exception as e:
+            logger.debug(f"single post err: {e}")
+            fail += 1
+        finally:
+            try:
+                if app: await app.stop()
+            except Exception: pass
+    logger.info(f"🔥 Post {chat_id}:{msg_id} → reactions={ok_re} views={ok_vw} fail={fail}")
+
+
+async def _process_channel_new_posts(ch_link: str):
+    """Backup poller — catches posts if raw listener missed them."""
+    resolved = extract_username_from_link(ch_link)
+    if not resolved: return
+
+    accs = await db_call(accounts_col.find({}).to_list, length=3000, default=[]) or []
+    accs = [a for a in accs if _is_valid_session(a.get("session"))]
+    if not accs: return
+
     recent, cid = [], None
     try:
         async with make_session_client(accs[0]["session"], "cw", no_updates=True) as app:
             chat = await get_chat_safe(app, ch_link)
-            if not chat:
-                return
+            if not chat: return
             cid = chat.id
             recent = await _fetch_recent_ids(app, cid, limit=10)
     except Exception as e:
         logger.debug(f"channel watcher fetch err {resolved}: {e}")
         return
+    if not recent: return
 
-    if not recent:
-        return
-
-    # 2) figure out which are new
     new_posts = []
     for mid in recent:
         seen = await db_call(chan_seen_col.find_one,
@@ -521,20 +717,14 @@ async def _process_channel_new_posts(ch_link: str):
             await db_call(chan_seen_col.update_one,
                 {"chat_id": cid, "msg_id": mid},
                 {"$set": {"chat_id": cid, "msg_id": mid,
-                          "seen_at": datetime.utcnow()}},
-                upsert=True)
-
-    if not new_posts:
-        return
+                          "seen_at": datetime.utcnow()}}, upsert=True)
+    if not new_posts: return
 
     logger.info(f"📺 Channel {resolved}: {len(new_posts)} new post(s) → react+view")
-
     reactions = await get_positive_reactions()
     ok_re = ok_vw = fail = 0
-
     for acc in accs:
-        if kill_event.is_set():
-            break
+        if kill_event.is_set(): break
         app = None
         try:
             app = make_session_client(acc["session"], "cvw", no_updates=True)
@@ -544,23 +734,16 @@ async def _process_channel_new_posts(ch_link: str):
             except Exception:
                 try:
                     await app.join_chat(ch_link)
-                except UserAlreadyParticipant:
-                    pass
-                except Exception:
-                    pass
+                except UserAlreadyParticipant: pass
+                except Exception: pass
                 chat = await get_chat_safe(app, ch_link)
-                if not chat:
-                    continue
+                if not chat: continue
                 peer = await app.resolve_peer(chat.id)
-
             for mid in new_posts:
                 emoji = random.choice(reactions)
-                if await safe_send_reaction(app, peer, mid, emoji, chat_id=cid):
-                    ok_re += 1
-                if await safe_view_message(app, peer, mid):
-                    ok_vw += 1
-                await asyncio.sleep(random.uniform(0.6, 1.4))
-            await asyncio.sleep(random.uniform(0.5, 1.2))
+                if await safe_send_reaction(app, peer, mid, emoji, chat_id=cid): ok_re += 1
+                if await safe_view_message(app, peer, mid): ok_vw += 1
+                await asyncio.sleep(random.uniform(0.4, 1.0))
         except Exception as e:
             logger.debug(f"channel watcher acct err: {e}")
             fail += 1
@@ -568,7 +751,6 @@ async def _process_channel_new_posts(ch_link: str):
             try:
                 if app: await app.stop()
             except Exception: pass
-
     logger.info(f"📺 Channel {resolved} done: reactions={ok_re} views={ok_vw} fail={fail}")
 
 
@@ -576,10 +758,11 @@ async def channel_watcher_task():
     global channel_watcher_started
     if channel_watcher_started: return
     channel_watcher_started = True
-    logger.info(f"📺 Channel watcher started — poll every {CHANNEL_POST_POLL}s")
+    logger.info(f"📺 Channel backup watcher started — poll every {CHANNEL_POST_POLL}s")
     await asyncio.sleep(20)
     while True:
         try:
+            await refresh_watched_chat_ids()
             channels = await get_default_channels()
             for ch in channels:
                 try:
@@ -593,27 +776,19 @@ async def channel_watcher_task():
 
 
 async def _force_process_channel(ch_link: str):
-    """Force react+view on latest 3 posts (ignore seen records) — for tests."""
-    resolved = extract_username_from_link(ch_link)
     accs = await db_call(accounts_col.find({}).to_list, length=3000, default=[]) or []
     accs = [a for a in accs if _is_valid_session(a.get("session"))]
-    if not accs:
-        return
-
+    if not accs: return
     try:
         async with make_session_client(accs[0]["session"], "cwf", no_updates=True) as app:
             chat = await get_chat_safe(app, ch_link)
-            if not chat:
-                return
+            if not chat: return
             cid = chat.id
             latest = await _fetch_recent_ids(app, cid, limit=3)
     except Exception as e:
-        logger.warning(f"force process err {resolved}: {e}")
+        logger.warning(f"force process err: {e}")
         return
-
-    if not latest:
-        return
-
+    if not latest: return
     reactions = await get_positive_reactions()
     for acc in accs[:50]:
         if kill_event.is_set(): break
@@ -629,7 +804,7 @@ async def _force_process_channel(ch_link: str):
                 emoji = random.choice(reactions)
                 await safe_send_reaction(app, peer, mid, emoji, chat_id=cid)
                 await safe_view_message(app, peer, mid)
-                await asyncio.sleep(random.uniform(1.0, 2.0))
+                await asyncio.sleep(random.uniform(0.8, 1.5))
         except Exception:
             pass
         finally:
@@ -639,7 +814,7 @@ async def _force_process_channel(ch_link: str):
 
 
 # ==========================================
-# 🎤 MULTI-VC JOIN (internal — used by auto-VC watcher)
+# 🎤 MULTI-VC JOIN (muted)
 # ==========================================
 async def _play_muted(call_py, chat_id, media_path):
     stream = MediaStream(media_path)
@@ -654,10 +829,8 @@ async def _play_muted(call_py, chat_id, media_path):
     if not played:
         try:
             await call_py.play(chat_id, stream)
-            try:
-                await call_py.mute(chat_id)
-            except Exception:
-                pass
+            try: await call_py.mute(chat_id)
+            except Exception: pass
             played = True
         except Exception as e:
             logger.debug(f"play fallback failed: {e}")
@@ -667,10 +840,6 @@ async def _play_muted(call_py, chat_id, media_path):
 async def multi_vc_join_all(uid: int, target_link: str, helpers: list,
                             media_path: str, silent: bool = True,
                             state_key: str = None):
-    """
-    Join all `helpers` (list of phone numbers) into the VC of target_link.
-    All mics are muted. Runs until the VC ends or reg['stop'] is set.
-    """
     if not PTGCALLS_AVAILABLE:
         logger.warning("PyTgCalls unavailable, cannot join VC")
         return
@@ -696,7 +865,6 @@ async def multi_vc_join_all(uid: int, target_link: str, helpers: list,
 
     for i, item in enumerate(sessions):
         if reg["stop"].is_set(): break
-
         if any(k.startswith(f"{item['phone']}:") for k in reg["active"]):
             ok += 1
             joined_phones.append(item["phone"])
@@ -711,7 +879,6 @@ async def multi_vc_join_all(uid: int, target_link: str, helpers: list,
                 in_memory=True, no_updates=True,
             )
             await app.start()
-
             chat = None
             try:
                 chat = await app.get_chat(resolved or target_link)
@@ -724,13 +891,11 @@ async def multi_vc_join_all(uid: int, target_link: str, helpers: list,
                 except Exception as e:
                     logger.warning(f"MVC target fail {item['phone']}: {e}")
                     chat = None
-
             if not chat:
                 raise RuntimeError("no target chat")
 
             call_py = PyTgCalls(app)
             await call_py.start()
-
             played = await _play_muted(call_py, chat.id, media_path)
             key = f"{item['phone']}:{chat.id}"
             reg["active"][key] = {
@@ -743,22 +908,18 @@ async def multi_vc_join_all(uid: int, target_link: str, helpers: list,
             joined_phones.append(item["phone"])
             if not played:
                 logger.debug(f"join-only (play failed) for {chat.id}")
-
-            await asyncio.sleep(1.2)
-
+            await asyncio.sleep(0.6)
         except Exception as e:
             logger.error(f"MVC join err ({item['phone']}): {e}")
             fail += 1
             try:
                 if app: await app.stop()
             except Exception: pass
-
         if i < len(sessions) - 1:
             waited = 0
             while waited < VC_JOIN_DELAY_SECONDS:
                 if reg["stop"].is_set(): break
-                await asyncio.sleep(1)
-                waited += 1
+                await asyncio.sleep(1); waited += 1
             if reg["stop"].is_set(): break
 
     if not reg["active"]:
@@ -785,12 +946,11 @@ async def multi_vc_join_all(uid: int, target_link: str, helpers: list,
         await db_call(vc_state_col.update_one, {"key": state_key},
             {"$set": {"key": state_key, "joined_phones": [],
                       "updated_at": datetime.utcnow()}}, upsert=True)
-
     logger.info(f"🎤 MVC stopped on {resolved}")
 
 
 # ==========================================
-# 🎤 AUTO VC WATCHER (livestream detect → instant join)
+# 🎤 AUTO VC WATCHER
 # ==========================================
 async def _check_vc_active(app, chat) -> bool:
     try:
@@ -800,59 +960,46 @@ async def _check_vc_active(app, chat) -> bool:
             full = await app.invoke(functions.channels.GetFullChannel(channel=peer))
             if getattr(full.full_chat, "call", None):
                 return True
-        except Exception:
-            pass
+        except Exception: pass
         try:
             full = await app.invoke(functions.messages.GetFullChat(chat_id=cid))
             if getattr(full.full_chat, "call", None):
                 return True
-        except Exception:
-            pass
+        except Exception: pass
     except Exception as e:
         logger.debug(f"VC check err: {e}")
     return False
 
 
-async def _auto_join_vc_for_channel(ch_link: str):
-    """
-    If a livestream/VC is live in this channel → join ALL accounts into it.
-    If it ended → release all joiners.
-    """
+async def _auto_join_vc_for_channel(ch_link: str, force: bool = False):
     resolved = extract_username_from_link(ch_link)
-    if not resolved:
-        return
+    if not resolved: return
 
     accs = await db_call(accounts_col.find({}).to_list, length=3000, default=[]) or []
     accs = [a for a in accs if _is_valid_session(a.get("session"))]
-    if not accs:
-        return
+    if not accs: return
 
-    # check VC status using first account
     has_vc = False
     checked = False
     cid = None
     try:
         async with make_session_client(accs[0]["session"], "vcchk", no_updates=True) as app:
             chat = await get_chat_safe(app, ch_link)
-            if not chat:
-                return
+            if not chat: return
             cid = chat.id
             has_vc = await _check_vc_active(app, chat)
             checked = True
     except Exception as e:
         logger.debug(f"VC check err {resolved}: {e}")
         return
-
-    if not checked or cid is None:
-        return
+    if not checked or cid is None: return
 
     state_key = f"autochan_{cid}"
     state = await db_call(vc_state_col.find_one, {"key": state_key}, default=None) or {}
     currently_joined = state.get("joined_phones", [])
 
     if has_vc and not currently_joined:
-        logger.info(f"🎤 VC LIVE in {resolved} → joining ALL accounts")
-        # schedule join in background so watcher stays fast
+        logger.info(f"🎤 VC LIVE in {resolved} → joining ALL accounts (force={force})")
         asyncio.create_task(multi_vc_join_all(
             uid=OWNER_ID,
             target_link=ch_link,
@@ -875,8 +1022,8 @@ async def vc_watcher_task():
     global vc_watcher_started
     if vc_watcher_started: return
     vc_watcher_started = True
-    logger.info(f"🎤 VC watcher started — poll every {VC_LIVESTREAM_POLL}s")
-    await asyncio.sleep(25)
+    logger.info(f"🎤 VC backup watcher started — poll every {VC_LIVESTREAM_POLL}s")
+    await asyncio.sleep(15)
     while True:
         try:
             channels = await get_default_channels()
@@ -885,7 +1032,7 @@ async def vc_watcher_task():
                     await _auto_join_vc_for_channel(ch)
                 except Exception as e:
                     logger.debug(f"vc watcher err {ch}: {e}")
-                await asyncio.sleep(2)
+                await asyncio.sleep(1)
         except Exception as e:
             logger.error(f"vc watcher error: {e}")
         await asyncio.sleep(VC_LIVESTREAM_POLL)
@@ -916,6 +1063,7 @@ async def unified_private_handler(client, message: Message):
         if text.startswith("/stopvc"):  return await cmd_stopvc(client, message)
         if text.startswith("/leavevc"): return await cmd_leavevc(client, message)
         if text.startswith("/cleanrevoked"): return await cmd_cleanrevoked(client, message)
+        if text.startswith("/reloadlisteners"): return await cmd_reload_listeners(client, message)
 
         await check_access(uid)
         admin_status = await is_admin(uid)
@@ -927,15 +1075,15 @@ async def unified_private_handler(client, message: Message):
         if message.audio or message.video or message.voice: return await handle_media_internal(client, message)
         if not text: return
 
-        if text == "🏓 Ping":
-            return await cmd_ping(client, message)
+        if text == "🏓 Ping": return await cmd_ping(client, message)
 
         if text == "📊 Stats":
             if admin_status:
                 ac = await db_call(accounts_col.count_documents, {}, default=0)
                 ch = await db_call(defaultchan_col.count_documents, {}, default=0)
                 return await message.reply(
-                    f"📊 **System Stats**\n📱 Accounts: `{ac}`\n📺 Default Channels: `{ch}`"
+                    f"📊 **System Stats**\n📱 Accounts: `{ac}`\n📺 Default Channels: `{ch}`\n"
+                    f"🗄️ DB: `{DB_NAME}`\n👂 Listeners: `{len(raw_listener_clients)}`"
                 )
             ac = await db_call(accounts_col.count_documents, {"added_by": uid}, default=0)
             return await message.reply(f"📊 **Your Stats**\n📱 Your Accounts: `{ac}`")
@@ -1288,6 +1436,8 @@ async def handle_document_internal(client, message: Message):
             except Exception: fail += 1
 
         await s.edit_text(f"🏁 **Import Complete**\n✅ `{ok}` | ❌ `{fail}`")
+        # start raw listeners for new accounts
+        asyncio.create_task(_start_raw_listeners())
     finally:
         try: os.remove(fp)
         except Exception: pass
@@ -1326,12 +1476,10 @@ async def execute_vc_join(message: Message, uid: int, data: dict):
     is_local_file = data.get("is_local_file", False)
 
     chat_target, _ = parse_telegram_link(target_link)
-
     all_accs = await db_call(accounts_col.find({}).to_list, length=3000, default=[]) or []
     all_accs = [a for a in all_accs if _is_valid_session(a.get("session"))]
     if vc_phone != "ALL":
         all_accs = [a for a in all_accs if a.get("phone") == vc_phone]
-
     if not all_accs: return await message.reply("❌ No valid accounts.")
     media_path = media_url if media_url else SILENT_FILE
     vc_stop_event.clear()
@@ -1342,9 +1490,7 @@ async def execute_vc_join(message: Message, uid: int, data: dict):
         f"Delay: `{VC_JOIN_DELAY_SECONDS}s` | Duration: `{data.get('duration', 1)}` min",
         reply_markup=stop_kb
     )
-
     local_clients = []; ok = fail = 0; vc_chat_id = chat_target; aborted = False
-
     for i, acc in enumerate(all_accs):
         if vc_stop_event.is_set() or kill_event.is_set():
             aborted = True; break
@@ -1375,16 +1521,14 @@ async def execute_vc_join(message: Message, uid: int, data: dict):
                 try:
                     await status.edit_text(
                         f"🎤 **Joining...** ✅ `{ok}` | ❌ `{fail}`\n`{i+1}/{len(all_accs)}`",
-                        reply_markup=stop_kb
-                    )
+                        reply_markup=stop_kb)
                 except Exception: pass
         except Exception as e:
             logger.error(f"VC err: {e}"); fail += 1
             try:
                 if app: await app.stop()
             except Exception: pass
-            await asyncio.sleep(min(VC_JOIN_DELAY_SECONDS, 5)); continue
-
+            await asyncio.sleep(min(VC_JOIN_DELAY_SECONDS, 3)); continue
         if i < len(all_accs) - 1:
             waited = 0
             while waited < VC_JOIN_DELAY_SECONDS:
@@ -1395,17 +1539,14 @@ async def execute_vc_join(message: Message, uid: int, data: dict):
 
     if not local_clients:
         return await status.edit_text("❌ No VC joined.")
-
     active_calls[str(vc_chat_id)] = local_clients
     await status.edit_text(
         f"{'🛑 Aborted' if aborted else '🎤 VC Joined'}\n✅ `{ok}` | ❌ `{fail}`\n"
         f"Staying `{data.get('duration', 1)}` min...", reply_markup=stop_kb)
-
     remaining = duration
     while remaining > 0:
         if vc_stop_event.is_set() or kill_event.is_set(): break
         await asyncio.sleep(min(remaining, 2)); remaining -= 2
-
     for blk in local_clients:
         try: await blk["call"].leave_call(blk["chat_id"])
         except Exception: pass
@@ -1423,12 +1564,10 @@ async def execute_engagement(message: Message, uid: int, data: dict):
     action = data.get("action")
     if action == "vc":
         return await execute_vc_join(message, uid, data)
-
     link = data.get("target_link", "")
     req_count = data.get("count", 0)
     comment_text = data.get("comment_text")
     chat_target, msg_id = parse_telegram_link(link)
-
     all_accs = await db_call(accounts_col.find({}).to_list, length=2000, default=[]) or []
     all_accs = [a for a in all_accs if _is_valid_session(a.get("session"))]
     if not all_accs: return await message.reply("❌ No accounts.")
@@ -1457,28 +1596,21 @@ async def execute_engagement(message: Message, uid: int, data: dict):
             await app.start()
             chat = await get_chat_safe(app, chat_target)
             if not chat: raise Exception("no chat")
-
             if action == "views" and msg_id:
                 peer = await app.resolve_peer(chat.id)
-                if await safe_view_message(app, peer, msg_id):
-                    ok += 1
-                else:
-                    fail += 1
+                if await safe_view_message(app, peer, msg_id): ok += 1
+                else: fail += 1
             elif action == "reacts" and msg_id:
                 emoji = random.choice(reactions)
                 sent = False
                 try:
-                    await app.send_reaction(chat.id, msg_id, emoji=emoji)
-                    sent = True
-                except Exception:
-                    pass
+                    await app.send_reaction(chat.id, msg_id, emoji=emoji); sent = True
+                except Exception: pass
                 if not sent:
                     peer = await app.resolve_peer(chat.id)
                     sent = await safe_send_reaction(app, peer, msg_id, emoji, chat_id=chat.id)
-                if sent:
-                    ok += 1
-                else:
-                    fail += 1
+                if sent: ok += 1
+                else: fail += 1
             elif action == "fastjoin":
                 try: await app.join_chat(chat_target)
                 except UserAlreadyParticipant: pass
@@ -1492,8 +1624,7 @@ async def execute_engagement(message: Message, uid: int, data: dict):
                     await disc.reply_text(comment_text)
                 except Exception:
                     try:
-                        await app.send_message(chat.id, comment_text,
-                                               reply_to_message_id=msg_id)
+                        await app.send_message(chat.id, comment_text, reply_to_message_id=msg_id)
                     except Exception: raise
                 ok += 1
         except Exception as e:
@@ -1552,6 +1683,8 @@ async def show_owner_panel(message: Message, uid: int, is_owner: bool, is_pseudo
              InlineKeyboardButton("⏰ Force Wake", callback_data="own_wake")]
         ])
         txt = (f"👑 **Owner Panel**\n\n"
+               f"🗄️ DB: `{DB_NAME}`\n"
+               f"👂 Listeners: `{len(raw_listener_clients)}`\n\n"
                f"📢 Default Channels ({len(chans)}):\n{chan_txt}\n\n"
                f"❤️ Default reactions: `{' '.join(reactions[:6])}...`")
     else:
@@ -1568,6 +1701,7 @@ async def show_owner_panel(message: Message, uid: int, is_owner: bool, is_pseudo
             [InlineKeyboardButton("⏰ Force Wake", callback_data="own_wake")]
         ])
         txt = (f"👑 **Pseudo-Owner Panel**\n_(no backup / manage-accounts)_\n\n"
+               f"🗄️ DB: `{DB_NAME}`\n"
                f"📢 Default Channels ({len(chans)}):\n{chan_txt}\n\n"
                f"❤️ Default reactions: `{' '.join(reactions[:6])}...`")
 
@@ -1585,10 +1719,12 @@ async def show_auto_channels_menu(message: Message, uid: int):
     else:
         for c in channels:
             txt += f"• `{c}`\n"
-    txt += ("\nEach channel gets:\n"
-            "• 🔥 Instant positive reaction on every new post\n"
-            "• 👀 Instant view from all accounts\n"
-            "• 🎤 Auto-join VC (muted) the moment a livestream starts\n")
+    txt += (f"\n🗄️ DB: `{DB_NAME}`\n"
+            f"👂 Listeners: `{len(raw_listener_clients)}`\n\n"
+            "Each channel gets:\n"
+            "• ⚡ **Instant** positive reaction via RAW event\n"
+            "• ⚡ **Instant** view from all accounts\n"
+            "• 🎤 **Instant** muted VC join the moment a livestream starts\n")
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Add Channel", callback_data="autochan_add")],
         [InlineKeyboardButton("🗑 Remove Channel", callback_data="autochan_remove")],
@@ -1628,7 +1764,6 @@ async def callback_handler(client, query: CallbackQuery):
         if data.startswith("own_") and not (is_owner or pseudo_status):
             return await query.answer("Owner only.", show_alert=True)
 
-        # ---------- AUTO-CHANNEL callbacks ----------
         if data == "autochan_add":
             user_data[uid] = {"step": "own_add_channel"}
             return await query.message.reply("📺 Send the channel link (@username or https://t.me/...):")
@@ -1640,8 +1775,7 @@ async def callback_handler(client, query: CallbackQuery):
         if data == "autochan_reset_seen":
             r = await db_call(chan_seen_col.delete_many, {})
             dc = getattr(r, "deleted_count", 0) if r else 0
-            return await query.message.reply(
-                f"✅ Cleared `{dc}` seen records. Next poll re-reacts.")
+            return await query.message.reply(f"✅ Cleared `{dc}` seen records.")
         if data == "autochan_test":
             channels = await get_default_channels()
             if not channels:
@@ -1650,7 +1784,7 @@ async def callback_handler(client, query: CallbackQuery):
             for ch in channels:
                 try: await _force_process_channel(ch)
                 except Exception as e: logger.error(f"test err: {e}")
-            await query.message.reply("✅ Force test done — check the channel.")
+            await query.message.reply("✅ Force test done.")
             return
         if data == "autochan_testvc":
             channels = await get_default_channels()
@@ -1658,17 +1792,16 @@ async def callback_handler(client, query: CallbackQuery):
                 return await query.answer("No default channels.", show_alert=True)
             await query.message.reply("🎤 Checking VCs now (joining if live)...")
             for ch in channels:
-                try: await _auto_join_vc_for_channel(ch)
+                try: await _auto_join_vc_for_channel(ch, force=True)
                 except Exception as e: logger.error(f"vc test err: {e}")
             await query.message.reply("✅ VC check done.")
             return
 
-        # ---------- OWNER callbacks ----------
         if data == "own_list":
             u_ = await db_call(users_col.find({}).to_list, length=None, default=[]) or []
             a_ = await db_call(admin_col.find({}).to_list, length=None, default=[]) or []
             p_ = await db_call(pseudo_col.find({}).to_list, length=None, default=[]) or []
-            txt = f"👑 Owner: `{OWNER_ID}`\n\n👑 Pseudo-Owners:\n"
+            txt = f"👑 Owner: `{OWNER_ID}`\n🗄️ DB: `{DB_NAME}`\n\n👑 Pseudo-Owners:\n"
             for p in p_: txt += f"`{p['user_id']}`\n"
             txt += "\n👮 Admins:\n"
             for a in a_: txt += f"`{a['user_id']}`\n"
@@ -1683,31 +1816,30 @@ async def callback_handler(client, query: CallbackQuery):
         if data == "own_rmpseudo":
             if not is_owner: return await query.answer("Owner only.", show_alert=True)
             user_data[uid] = {"step": "own_rmpseudo"}
-            return await query.message.reply("🚫 Send User ID to remove from Pseudo-Owner:")
+            return await query.message.reply("🚫 Send User ID to remove:")
         if data == "own_addadmin":
             user_data[uid] = {"step": "own_addadmin"}
             return await query.message.reply("🆔 Send User ID to make Admin:")
         if data == "own_rmadmin":
             user_data[uid] = {"step": "own_rmadmin"}
-            return await query.message.reply("🆔 Send User ID to remove from Admin:")
+            return await query.message.reply("🆔 Send User ID to remove:")
         if data == "own_add_channel":
             user_data[uid] = {"step": "own_add_channel"}
-            return await query.message.reply("📺 Send the channel link (@username or https://t.me/...):")
+            return await query.message.reply("📺 Send the channel link:")
         if data == "own_rm_channel":
             user_data[uid] = {"step": "own_remove_channel"}
             return await query.message.reply("🗑 Send the channel link to remove:")
         if data == "own_set_reactions":
             user_data[uid] = {"step": "own_default_reactions"}
             return await query.message.reply(
-                "❤️ Send the **positive reactions** separated by spaces or commas:\n"
-                "Example: `👍 ❤️ 🔥 🥰 👏 😁 🎉`"
-            )
+                "❤️ Send the positive reactions separated by spaces or commas:\n"
+                "Example: `👍 ❤️ 🔥 🥰 👏 😁 🎉`")
         if data == "own_health":
             asyncio.create_task(run_health_check(query.message))
             return await query.answer("Started.", show_alert=True)
         if data == "own_clean_revoked":
             asyncio.create_task(clean_revoked_task(query.message))
-            return await query.answer("Scanning & cleaning revoked sessions...", show_alert=True)
+            return await query.answer("Scanning...", show_alert=True)
         if data == "own_rm_dead_confirm":
             dead = DEAD_ACCOUNTS.pop(query.message.chat.id, [])
             if not dead: return await query.answer("None.", show_alert=True)
@@ -1723,12 +1855,10 @@ async def callback_handler(client, query: CallbackQuery):
             asyncio.create_task(manual_wake_task(query.message))
             return await query.answer("Waking...", show_alert=True)
 
-        # ---------- VC stop ----------
         if data.startswith("vcstop_"):
             vc_stop_event.set()
             return await query.answer("🛑 Stop signal sent.", show_alert=True)
 
-        # ---------- Engagement ----------
         if data == "eng_vcmenu":
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🎤 All Accounts", callback_data="engvc_all")],
@@ -1756,7 +1886,6 @@ async def callback_handler(client, query: CallbackQuery):
             user_data[uid] = {"step": "eng_target", "action": action}
             return await query.message.reply("🎯 Send Target Chat/Message Link:")
 
-        # ---------- Manage accounts ----------
         if data.startswith("manage_"):
             phone = data.split("_", 1)[1]
             acc = await db_call(accounts_col.find_one, {"phone": phone}, default=None)
@@ -1839,7 +1968,6 @@ async def callback_handler(client, query: CallbackQuery):
                               "edit_action": p[1], "action": "editchan"}
             await query.message.reply("Send target channel ID/username:")
 
-        # ---------- Bot welcome ----------
         if data == "bot_edit_welcome":
             user_data[uid] = {"step": "set_bot_welcome_pic"}
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Skip Photo", callback_data="skip_bot_pic")]])
@@ -1899,6 +2027,8 @@ async def finalize_login(message, uid):
     try: await temp.disconnect()
     except Exception: pass
     user_data.pop(uid, None)
+    # start raw listener for new account immediately
+    asyncio.create_task(_start_raw_listeners())
 
 
 async def fetch_account_info(message, phone, uid):
@@ -2271,6 +2401,8 @@ async def cmd_ping(client, message: Message):
         f"🏓 **Pong!**\n"
         f"⏱ Latency: `{(t1-t0)*1000:.0f} ms`\n"
         f"🤖 Bot: `{bot_name}`\n"
+        f"🗄️ DB: `{DB_NAME}`\n"
+        f"👂 Listeners: `{len(raw_listener_clients)}`\n"
         f"📅 Time: `{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC`"
     )
     try: await msg.edit_text(text)
@@ -2313,17 +2445,28 @@ async def cmd_cleanrevoked(client, message: Message):
     asyncio.create_task(clean_revoked_task(message))
 
 
+async def cmd_reload_listeners(client, message: Message):
+    if not await is_admin(message.from_user.id): return await message.reply("Admins only.")
+    await message.reply("🔄 Reloading raw listeners...")
+    asyncio.create_task(_start_raw_listeners())
+    await refresh_watched_chat_ids()
+
+
 # ==========================================
 # ▶️ BOOT
 # ==========================================
 async def _run_bot():
     logger.info("Initializing background services...")
+    await refresh_watched_chat_ids()
     await ensure_worker_started()
     asyncio.create_task(dummy_web_server())
     asyncio.create_task(auto_online_task())
     asyncio.create_task(channel_watcher_task())
     asyncio.create_task(vc_watcher_task())
-    logger.info("Bot fully operational.")
+    asyncio.create_task(raw_listener_supervisor())
+    # start listeners immediately in background too
+    asyncio.create_task(_start_raw_listeners())
+    logger.info(f"Bot fully operational. DB={DB_NAME}")
     await idle()
 
 
