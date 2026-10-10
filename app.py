@@ -11,6 +11,31 @@ _builtins.input = _no_input
 import os, sys, asyncio, logging, random, uuid, time, zipfile, json, glob, shutil, sqlite3, struct, base64, wave
 from datetime import datetime
 
+# ==========================================
+# 🔐 LOAD .env  (must be before any os.getenv)
+# ==========================================
+try:
+    from dotenv import load_dotenv
+    _ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if os.path.exists(_ENV_PATH):
+        load_dotenv(_ENV_PATH, override=True)
+    else:
+        load_dotenv(override=True)  # fallback: look in cwd
+except ImportError:
+    # dotenv not installed — try manual parse so .env still works
+    _ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if os.path.exists(_ENV_PATH):
+        with open(_ENV_PATH) as _f:
+            for _line in _f:
+                _line = _line.strip()
+                if not _line or _line.startswith("#") or "=" not in _line:
+                    continue
+                _k, _v = _line.split("=", 1)
+                _k = _k.strip()
+                _v = _v.strip().strip('"').strip("'")
+                if _k and _k not in os.environ:
+                    os.environ[_k] = _v
+
 import pyrogram
 import pyrogram.errors
 import pyrogram.utils
